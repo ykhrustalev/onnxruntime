@@ -491,7 +491,7 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
                             is_supported_quant_type(k_quant_type_) && is_supported_quant_type(v_quant_type_) &&
                             (!is_fp8_cache || device_prop.major >= 9 || (device_prop.major == 8 && device_prop.minor == 9)));
   // Speculative verification steps (2..8 new tokens per sequence) run on the paged XQA kernel with
-  // a packed lower-triangular mask built by PagedXqaSpecDecCausalMaskKernel. The gate is the
+  // a packed mask built by PagedXqaSpecDecMaskKernel. The gate is the
   // metadata query bound, not the aggregate token count: a zero-heavy ragged step can have
   // token_count <= batch_size while still carrying a multi-token sequence. Local windows and
   // attention sinks stay eligible: the kernel's rows are flattened (query token, query head) pairs,
@@ -504,21 +504,12 @@ Status PagedAttention<T, TCACHE>::ComputeInternal(OpKernelContext* context) cons
   const bool portable_spec_dec_candidate =
       has_metadata_bounds && max_query_len_bound > 1 && max_query_len_bound <= 8 &&
       (std::is_same_v<TCACHE, uint8_t> || (kIsQuantizedCache && per_channel_k && !enable_per_channel_xqa_));
-  // Only the FlashAttention backend takes a causality flag; the paged decode and CUTLASS kernels
-  // both hard-code a bottom-right causal mask.
   bool use_paged_decode =
-      decode_eligible && parameters.is_causal &&
+      decode_eligible &&
       ((decode_shaped && (kIsQuantizedCache || fp16_xqa_eligible || !flash_eligible)) ||
        xqa_spec_dec_candidate || portable_spec_dec_candidate);
   bool use_flash_attention = flash_eligible && !use_paged_decode;
-  const bool use_memory_efficient_attention = mea_eligible && !use_paged_decode && parameters.is_causal;
-
-  if (!parameters.is_causal && !use_flash_attention) {
-    return ORT_MAKE_STATUS(ONNXRUNTIME, INVALID_ARGUMENT,
-                           "PagedAttention: is_causal=0 requires the FlashAttention backend (sm>=80, fp16/bf16, "
-                           "head_size ",
-                           parameters.head_size, ", block_size ", parameters.block_size, ").");
-  }
+  const bool use_memory_efficient_attention = mea_eligible && !use_paged_decode;
 
   // Both gather-based backends need a dense KV staging buffer when the cache is quantized
   // (FlashAttention cannot read a quantized page, and the CUTLASS kernel is not paged at all).
