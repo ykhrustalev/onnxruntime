@@ -1,6 +1,11 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+#include <algorithm>
+#include <cmath>
+#include <utility>
+#include <vector>
+
 #include "gtest/gtest.h"
 #include "core/session/onnxruntime_session_options_config_keys.h"
 #include "test/common/tensor_op_test_utils.h"
@@ -2118,6 +2123,161 @@ TEST(MoETest, QMoETest_CPU_Int4_MLAS) {
 #else
   GTEST_SKIP() << "Skipping CPU QMoE test";
 #endif
+}
+
+// Block-wise 4-bit SwiGLU QMoE on CPU with non-trivial weights. Block-wise symmetric 4/8-bit experts
+// without zero points take the MLAS QNBit GEMM (MatMulNBits kernel) path; the expected output is an
+// fp32 reference computed here from the dequantized weights and the kernel's routing (softmax over
+// the top-k router logits).
+namespace {
+struct QMoEBlockWiseCase {
+  int num_rows;
+  int num_experts;
+  int hidden_size;
+  int inter_size;
+  int block_size;
+  int top_k;
+  bool with_bias;
+};
+
+void RunQMoECpuInt4BlockWiseSwiGLU(const QMoEBlockWiseCase& c, float tolerance) {
+  const int num_rows = c.num_rows, num_experts = c.num_experts, hidden_size = c.hidden_size;
+  const int inter_size = c.inter_size, block_size = c.block_size, top_k = c.top_k;
+  const int fc1_rows = 2 * inter_size;  // interleaved [gate, up] rows
+  const int fc1_blocks = hidden_size / block_size;
+  const int fc2_blocks = inter_size / block_size;
+
+  // Deterministic pseudo-random data.
+  uint32_t state = 0x12345678u;
+  auto next_uniform = [&state]() {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<float>((state >> 8) & 0xFFFF) / 65535.0f;  // [0, 1]
+  };
+  auto next_code = [&state]() {
+    state = state * 1664525u + 1013904223u;
+    return static_cast<uint8_t>((state >> 12) & 0xF);
+  };
+
+  std::vector<float> input(static_cast<size_t>(num_rows * hidden_size));
+  for (auto& v : input) v = 2.0f * next_uniform() - 1.0f;
+  std::vector<float> router_probs(static_cast<size_t>(num_rows * num_experts));
+  for (auto& v : router_probs) v = 4.0f * next_uniform() - 2.0f;
+
+  // Weights are stored as [E, N, K/2] uint8 with the even k in the low nibble; scales as [E, N, K/block].
+  std::vector<uint8_t> fc1_codes(static_cast<size_t>(num_experts * fc1_rows * hidden_size));
+  std::vector<uint8_t> fc2_codes(static_cast<size_t>(num_experts * hidden_size * inter_size));
+  for (auto& v : fc1_codes) v = next_code();
+  for (auto& v : fc2_codes) v = next_code();
+  auto pack = [](const std::vector<uint8_t>& codes) {
+    std::vector<uint8_t> packed(codes.size() / 2);
+    for (size_t i = 0; i < packed.size(); ++i) {
+      packed[i] = static_cast<uint8_t>((codes[2 * i] & 0xF) | ((codes[2 * i + 1] & 0xF) << 4));
+    }
+    return packed;
+  };
+  const std::vector<uint8_t> fc1_weights = pack(fc1_codes);
+  const std::vector<uint8_t> fc2_weights = pack(fc2_codes);
+  std::vector<float> fc1_scales(static_cast<size_t>(num_experts * fc1_rows * fc1_blocks));
+  std::vector<float> fc2_scales(static_cast<size_t>(num_experts * hidden_size * fc2_blocks));
+  // Signed scales, as produced by MatMulNBits-style quantizers.
+  for (auto& v : fc1_scales) v = (next_uniform() < 0.5f ? -1.0f : 1.0f) * (0.01f + 0.03f * next_uniform());
+  for (auto& v : fc2_scales) v = (next_uniform() < 0.5f ? -1.0f : 1.0f) * (0.01f + 0.03f * next_uniform());
+  std::vector<float> fc1_bias, fc2_bias;
+  if (c.with_bias) {
+    fc1_bias.resize(static_cast<size_t>(num_experts * fc1_rows));
+    fc2_bias.resize(static_cast<size_t>(num_experts * hidden_size));
+    for (auto& v : fc1_bias) v = 0.2f * next_uniform() - 0.1f;
+    for (auto& v : fc2_bias) v = 0.2f * next_uniform() - 0.1f;
+  }
+
+  auto dequant = [&](const std::vector<uint8_t>& codes, const std::vector<float>& scales, int e, int n, int k,
+                     int rows, int cols, int blocks) {
+    const float scale = scales[static_cast<size_t>((e * rows + n) * blocks + k / block_size)];
+    return (static_cast<float>(codes[static_cast<size_t>((e * rows + n) * cols + k)]) - 8.0f) * scale;
+  };
+
+  // fp32 reference.
+  std::vector<float> expected(static_cast<size_t>(num_rows * hidden_size), 0.0f);
+  for (int t = 0; t < num_rows; ++t) {
+    const float* logits = router_probs.data() + t * num_experts;
+    std::vector<std::pair<float, int>> sorted;
+    for (int e = 0; e < num_experts; ++e) sorted.emplace_back(logits[e], e);
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    float sum_exp = 0.0f;
+    std::vector<float> weights(static_cast<size_t>(top_k));
+    for (int j = 0; j < top_k; ++j) {
+      weights[j] = std::exp(sorted[j].first - sorted[0].first);
+      sum_exp += weights[j];
+    }
+    for (int j = 0; j < top_k; ++j) {
+      const int e = sorted[j].second;
+      const float w = weights[j] / sum_exp;
+      const float* x = input.data() + t * hidden_size;
+      std::vector<float> h(static_cast<size_t>(fc1_rows));
+      for (int n = 0; n < fc1_rows; ++n) {
+        float acc = c.with_bias ? fc1_bias[static_cast<size_t>(e * fc1_rows + n)] : 0.0f;
+        for (int k = 0; k < hidden_size; ++k) acc += x[k] * dequant(fc1_codes, fc1_scales, e, n, k, fc1_rows, hidden_size, fc1_blocks);
+        h[n] = acc;
+      }
+      std::vector<float> a(static_cast<size_t>(inter_size));
+      for (int i = 0; i < inter_size; ++i) {
+        const float gate = h[2 * i], up = h[2 * i + 1];
+        a[i] = gate / (1.0f + std::exp(-gate)) * up;
+      }
+      for (int n = 0; n < hidden_size; ++n) {
+        float acc = c.with_bias ? fc2_bias[static_cast<size_t>(e * hidden_size + n)] : 0.0f;
+        for (int k = 0; k < inter_size; ++k) acc += a[k] * dequant(fc2_codes, fc2_scales, e, n, k, hidden_size, inter_size, fc2_blocks);
+        expected[static_cast<size_t>(t * hidden_size + n)] += w * acc;
+      }
+    }
+  }
+
+  OpTester tester("QMoE", 1, onnxruntime::kMSDomain);
+  tester.AddAttribute<int64_t>("k", top_k);
+  tester.AddAttribute<std::string>("activation_type", "swiglu");
+  tester.AddAttribute<int64_t>("swiglu_fusion", 1);
+  tester.AddAttribute<float>("activation_alpha", 1.0f);
+  tester.AddAttribute<float>("activation_beta", 0.0f);
+  tester.AddAttribute<int64_t>("normalize_routing_weights", 1);
+  tester.AddAttribute<int64_t>("expert_weight_bits", 4);
+  tester.AddAttribute<int64_t>("block_size", block_size);
+
+  tester.AddInput<float>("input", {num_rows, hidden_size}, input);
+  tester.AddInput<float>("router_probs", {num_rows, num_experts}, router_probs);
+  tester.AddInput<uint8_t>("fc1_experts_weights", {num_experts, fc1_rows, hidden_size / 2}, fc1_weights);
+  tester.AddInput<float>("fc1_scales", {num_experts, fc1_rows, fc1_blocks}, fc1_scales);
+  if (c.with_bias) {
+    tester.AddInput<float>("fc1_experts_bias", {num_experts, fc1_rows}, fc1_bias);
+  } else {
+    tester.AddOptionalInputEdge<float>();
+  }
+  tester.AddInput<uint8_t>("fc2_experts_weights", {num_experts, hidden_size, inter_size / 2}, fc2_weights);
+  tester.AddInput<float>("fc2_scales", {num_experts, hidden_size, fc2_blocks}, fc2_scales);
+  if (c.with_bias) {
+    tester.AddInput<float>("fc2_experts_bias", {num_experts, hidden_size}, fc2_bias);
+  } else {
+    tester.AddOptionalInputEdge<float>();
+  }
+  tester.AddOutput<float>("output", {num_rows, hidden_size}, expected);
+  tester.SetOutputTolerance(tolerance);
+
+  std::vector<std::unique_ptr<IExecutionProvider>> eps;
+  eps.push_back(DefaultCpuExecutionProvider());
+  tester.Run(OpTester::ExpectResult::kExpectSuccess, "", {}, nullptr, &eps);
+}
+}  // namespace
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_Decode) {
+  // Single token: the QNBit path runs the selected experts sequentially, each GEMM threaded internally.
+  RunQMoECpuInt4BlockWiseSwiGLU({1, 8, 64, 64, 32, 2, false}, 0.01f);
+}
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_Prefill) {
+  RunQMoECpuInt4BlockWiseSwiGLU({37, 4, 128, 96, 32, 2, false}, 0.01f);
+}
+
+TEST(MoETest, QMoETest_CPU_Int4_BlockWise_SwiGLU_Bias_Block64) {
+  RunQMoECpuInt4BlockWiseSwiGLU({5, 4, 128, 64, 64, 3, true}, 0.01f);
 }
 
 TEST(MoETest, QMoETest_CPU_Int8_MLAS) {
